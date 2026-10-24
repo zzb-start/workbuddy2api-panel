@@ -713,6 +713,98 @@ baseURL 指向 `<网关>/v1/search`，即可零代码接入本网关的搜索能
 
 **余额后台刷新**（`schedule.balance_refresh_enabled`，缺省开启）：每 `balance_refresh_minutes`（缺省 5）分钟并发查询全部账号余额并更新池内积分——两次签到时点之间 credits 保持新鲜，余额恢复的冷却账号也会自动解冻（语义同签到，但不做签到不刷 token）。面板「立即刷新」按钮也是全量刷余额；5 秒自动轮询只读内存，不打上游。
 
+## 客户端接入：Claude Code
+
+本网关只对客户端暴露 **OpenAI 兼容**接口（`POST /v1/chat/completions`），
+而 Claude Code 说的是 **Anthropic Messages** 协议（`POST /v1/messages`）。
+`internal/server/handler.go` 里对此有明确注释：
+
+```go
+// /v1/messages——那是 Anthropic 模型对话的标准路径，留给未来的 chat 转发。
+```
+
+即：**当前没有 `/v1/messages` 的对话转发**，Claude Code 无法直连，中间必须有一层协议翻译。
+下面是经过实际验证的方案（Windows + Claude Code 2.1.306 + claude-code-router 1.0.73）。
+
+```
+Claude Code ──Anthropic──▶ ccr (127.0.0.1:3456) ──OpenAI──▶ 本网关 (:7863) ──▶ 上游
+```
+
+### 1. 安装 claude-code-router
+
+```bash
+npm install -g @musistudio/claude-code-router
+```
+
+### 2. 配置 `~/.claude-code-router/config.json`
+
+```json
+{
+  "LOG": true,
+  "API_TIMEOUT_MS": 600000,
+  "HOST": "127.0.0.1",
+  "PORT": 3456,
+  "Providers": [
+    {
+      "name": "workbuddy",
+      "api_base_url": "http://127.0.0.1:7863/v1/chat/completions",
+      "api_key": "<config.json 里的 api_key>",
+      "models": ["global:glm-5.3", "global:glm-5.3-flash", "global:kimi-k3"],
+      "transformer": { "use": [["maxtoken", { "max_tokens": 32000 }]] }
+    }
+  ],
+  "Router": {
+    "default": "workbuddy,global:glm-5.3",
+    "background": "workbuddy,global:glm-5.3-flash",
+    "longContext": "workbuddy,global:kimi-k3",
+    "longContextThreshold": 60000
+  }
+}
+```
+
+注意 `api_base_url` 要写 **`/v1/chat/completions` 全路径**，不是 `/v1`。
+
+### 3. 启动并切换模型
+
+```bash
+ccr code
+```
+
+```
+/model workbuddy,global:glm-5.3
+```
+
+### ⚠️ 模型名必须带域前缀
+
+当账号池里有国际版（workbuddy.ai）账号时，`GET /v1/models` 返回的 id 形如 `global:glm-5.3`。
+前缀是网关用来区分国内 / 国际两个账号池的。
+
+**用裸名（如 `glm-5.3`）会被当作国内域模型，去国内池找账号**，若池里只有国际版账号则返回：
+
+```json
+{"error":{"code":"no_healthy_account",
+ "gateway_hint":"no healthy account available in pool; check /status or retry later"}}
+```
+
+这个报错极具误导性——看起来像账号全部不可用，实际是模型名少了前缀。
+排查时先确认 `/v1/models` 里 id 的完整形态，再逐字对照。
+
+### 常见错误对照
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `503 no_healthy_account` | 模型名缺 `cn:` / `global:` 前缀，或账号池真的空 | 先核对 `/v1/models` 的 id 形态 |
+| `400` + 内容审核文案 | 客户端固定 system 模板被上游逐字匹配误杀 | 保持 `prompt.mode=custom`，勿改 `passthrough` |
+| 工具不执行、标记变成纯文本 | `tools` 在中转环节丢失 | 确认版本包含「原生工具调用标记还原」 |
+| `ECONNREFUSED 127.0.0.1:3456` | ccr 未启动 | 用 `ccr code` 启动 |
+
+### Windows 补充
+
+- ccr 是 Node 程序，内部用 `spawn("node", ...)` 拉起服务，**`node` 必须在 PATH 里**
+  （只把 `node.exe` 放在某个目录不够，会报 `spawn node ENOENT`）。
+- 启动脚本若是 `.bat`，**必须 CRLF 换行**；LF 行尾会让 cmd 解析 `if (...)` 块出错，表现为窗口闪退。
+- `auth_dir` / `state_file` 默认是相对路径，启动网关时**工作目录必须是仓库根**。
+
 ## 🖥️ Web 管理面板
 
 内嵌式管理面板（`internal/panel`，前端 go:embed 单文件打进二进制，无外部构建依赖），服务启动后访问：
